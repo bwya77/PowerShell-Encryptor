@@ -32,26 +32,43 @@ Generates a random AES key based on the desired key size.
 .PARAMETER KeySize
 Number of bits the generated key will have.
 
+.PARAMETER AsPlainText
+Returns a String instead of SecureString.
+
+.OUTPUTS
+System.Security.SecureString. New-AESKey return the key as a SecureString by default.
+System.String. New-AESKey will return the key in plain text as a string if the -AsPlainText parameter is specified.
+
 .EXAMPLE
 $key = New-AESKey
 This example generates a random 256-bit AES key and stores it in the variable $key.
 
 .NOTES
 Author: Tyler Siegrist
-Date: 9/17/2017
+Date: 9/18/2017
 #>
 		[CmdletBinding()]
-		[OutputType([String])]
+		[OutputType([System.Security.SecureString])]
+		[OutputType([String], ParameterSetName = 'PlainText')]
 		Param (
 			[Parameter(Mandatory = $false, Position = 1)]
 			[ValidateSet(128, 192, 256)]
-			[Int]$KeySize = 256
+			[Int]$KeySize = 256,
+			[Parameter(ParameterSetName = 'PlainText')]
+			[Switch]$AsPlainText
 		)
 		
-		$AESProvider = New-Object "System.Security.Cryptography.AesManaged"
-		$AESProvider.KeySize = $KeySize
-		$AESProvider.GenerateKey()
-		return [System.Convert]::ToBase64String($AESProvider.Key)
+		$AES = New-Object "System.Security.Cryptography.AesManaged"
+		$AES.KeySize = $KeySize
+		$AES.GenerateKey()
+		if ($AsPlainText)
+		{
+			return [System.Convert]::ToBase64String($AES.Key)
+		}
+		else
+		{
+			return [System.Convert]::ToBase64String($AES.Key) | ConvertTo-SecureString -AsPlainText -Force
+		}
 	}
 	
 	Function Protect-File
@@ -67,13 +84,25 @@ Encrypts a file using AES via a provided or randomly generated key.
 File(s) to be encrypted.
 
 .PARAMETER Key
-AES key to be used for encryption.
+AES key as a SecureString to be used for encryption.
+
+.PARAMETER KeyAsPlainText
+AES key as a String to be used for encryption.
 
 .PARAMETER Suffix
 Suffix of the encrypted file to be removed.
 
+.PARAMETER CipherMode
+Specifies the block cipher mode to use for encryption.
+
+.PARAMETER PaddingMode
+Specifies the type of padding to apply when the message data block is shorter than the full number of bytes needed for a cryptographic operation.
+
 .PARAMETER RemoveSource
 Removes the source (decrypted) file after encrypting.
+
+.OUTPUTS
+System.IO.FileInfo. Protect-File will return FileInfo with the SourceFile and Key as added NoteProperties
 
 .EXAMPLE
 Protect-File 'C:\secrets.txt' $key
@@ -89,18 +118,24 @@ This example encrypts all of the files under the C:\Files directory using the ke
 
 .NOTES
 Author: Tyler Siegrist
-Date: 9/17/2017
+Date: 9/18/2017
 #>
-		[CmdletBinding()]
+		[CmdletBinding(DefaultParameterSetName = 'SecureString')]
 		[OutputType([System.IO.FileInfo[]])]
 		Param (
 			[Parameter(Mandatory = $true, Position = 1, ValueFromPipeline = $true, ValueFromPipelineByPropertyName = $true)]
 			[Alias('PSPath', 'LiteralPath')]
 			[string[]]$FileName,
-			[Parameter(Mandatory = $false, Position = 2)]
-			[String]$Key = (New-AESKey),
+			[Parameter(Mandatory = $false, Position = 2, ParameterSetName = 'SecureString')]
+			[System.Security.SecureString]$Key = (New-AESKey),
+			[Parameter(Mandatory = $true, Position = 2, ParameterSetName = 'PlainText')]
+			[String]$KeyAsPlainText,
 			[Parameter(Mandatory = $false, Position = 3)]
 			[String]$Suffix = '.AES',
+			[Parameter(Mandatory = $false, Position = 4)]
+			[System.Security.Cryptography.CipherMode]$CipherMode = 'CBC',
+			[Parameter(Mandatory = $false, Position = 5)]
+			[System.Security.Cryptography.PaddingMode]$PaddingMode = 'PKCS7',
 			[Parameter()]
 			[Switch]$RemoveSource
 		)
@@ -109,13 +144,20 @@ Date: 9/17/2017
 			#Configure AES
 			try
 			{
-				$EncryptionKey = [System.Convert]::FromBase64String($Key)
-				$KeySize = $EncryptionKey.Length * 8
-				$AESProvider = New-Object 'System.Security.Cryptography.AesManaged'
-				$AESProvider.Mode = [System.Security.Cryptography.CipherMode]::CBC
-				$AESProvider.BlockSize = 128
-				$AESProvider.KeySize = $KeySize
-				$AESProvider.Key = $EncryptionKey
+				if ($PSCmdlet.ParameterSetName -eq 'PlainText')
+				{
+					$Key = $KeyAsPlainText | ConvertTo-SecureString -AsPlainText -Force
+				}
+				
+				#Decrypt AES Key from SecureString
+				$BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($Key)
+				$EncryptionKey = [System.Convert]::FromBase64String([System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR))
+				
+				$AES = [System.Security.Cryptography.Aes]::Create()
+				$AES.Mode = $CipherMode
+				$AES.Padding = $PaddingMode
+				$AES.KeySize = $EncryptionKey.Length * 8
+				$AES.Key = $EncryptionKey
 			}
 			Catch
 			{
@@ -136,22 +178,14 @@ Date: 9/17/2017
 					$FileStreamWriter = New-Object System.IO.FileStream($DestinationFile, [System.IO.FileMode]::Create)
 					
 					#Write IV (initialization-vector) length & IV to encrypted file
-					$AESProvider.GenerateIV()
-					$FileStreamWriter.Write([System.BitConverter]::GetBytes($AESProvider.IV.Length), 0, 4)
-					$FileStreamWriter.Write($AESProvider.IV, 0, $AESProvider.IV.Length)
+					$AES.GenerateIV()
+					$FileStreamWriter.Write([System.BitConverter]::GetBytes($AES.IV.Length), 0, 4)
+					$FileStreamWriter.Write($AES.IV, 0, $AES.IV.Length)
 					
 					#Perform encryption
-					$Transform = $AESProvider.CreateEncryptor()
+					$Transform = $AES.CreateEncryptor()
 					$CryptoStream = New-Object System.Security.Cryptography.CryptoStream($FileStreamWriter, $Transform, [System.Security.Cryptography.CryptoStreamMode]::Write)
-					[Int]$Count = 0
-					[Int]$BlockSizeBytes = $AESProvider.BlockSize / 8
-					[Byte[]]$Data = New-Object Byte[] $BlockSizeBytes
-					Do
-					{
-						$Count = $FileStreamReader.Read($Data, 0, $BlockSizeBytes)
-						$CryptoStream.Write($Data, 0, $Count)
-					}
-					While ($Count -gt 0)
+					$FileStreamReader.CopyTo($CryptoStream)
 					
 					#Close open files
 					$CryptoStream.FlushFinalBlock()
@@ -171,6 +205,7 @@ Date: 9/17/2017
 					If ($FileStreamWriter)
 					{
 						#Remove failed file
+						$FileStreamWriter.Close()
 						Remove-Item -LiteralPath $DestinationFile -Force
 					}
 					Continue
@@ -199,13 +234,25 @@ Decrypts a file using a provided AES key.
 File(s) to be decrypted.
 
 .PARAMETER Key
-AES key to be used for decryption.
+AES key as a SecureString be used for decryption.
+
+.PARAMETER KeyAsPlainText
+AES key as a String to be used for decryption.
 
 .PARAMETER Suffix
 Suffix of the encrypted file to be removed.
 
+.PARAMETER CipherMode
+Specifies the block cipher mode that was used for encryption.
+
+.PARAMETER PaddingMode
+Specifies the type of padding that was applied when the message data block was shorter than the full number of bytes needed for a cryptographic operation.
+
 .PARAMETER RemoveSource
 Removes the source (encrypted) file after decrypting.
+
+.OUTPUTS
+System.IO.FileInfo. Unprotect-File will return FileInfo with the SourceFile as an added NoteProperty
 
 .EXAMPLE
 Unprotect-File 'C:\secrets.txt.AES' $key
@@ -221,18 +268,24 @@ This example decrypts all of the files under the C:\Files directory using the ke
 
 .NOTES
 Author: Tyler Siegrist
-Date: 9/17/2017
+Date: 9/18/2017
 #>
-		[CmdletBinding()]
+		[CmdletBinding(DefaultParameterSetName = 'SecureString')]
 		[OutputType([System.IO.FileInfo[]])]
 		Param (
 			[Parameter(Mandatory = $true, Position = 1, ValueFromPipeline = $true, ValueFromPipelineByPropertyName = $true)]
 			[Alias('PSPath', 'LiteralPath')]
 			[string[]]$FileName,
-			[Parameter(Mandatory = $true, Position = 2, ValueFromPipelineByPropertyName = $true)]
-			[String]$Key,
+			[Parameter(Mandatory = $true, Position = 2, ValueFromPipelineByPropertyName = $true, ParameterSetName = 'SecureString')]
+			[System.Security.SecureString]$Key,
+			[Parameter(Mandatory = $true, Position = 2, ValueFromPipelineByPropertyName = $true, ParameterSetName = 'PlainText')]
+			[String]$KeyAsPlainText,
 			[Parameter(Mandatory = $false, Position = 3)]
 			[String]$Suffix = '.AES',
+			[Parameter(Mandatory = $false, Position = 4)]
+			[System.Security.Cryptography.CipherMode]$CipherMode = 'CBC',
+			[Parameter(Mandatory = $false, Position = 5)]
+			[System.Security.Cryptography.PaddingMode]$PaddingMode = 'PKCS7',
 			[Parameter()]
 			[Switch]$RemoveSource
 		)
@@ -241,13 +294,20 @@ Date: 9/17/2017
 			#Configure AES
 			try
 			{
-				$EncryptionKey = [System.Convert]::FromBase64String($Key)
-				$KeySize = $EncryptionKey.Length * 8
-				$AESProvider = New-Object 'System.Security.Cryptography.AesManaged'
-				$AESProvider.Mode = [System.Security.Cryptography.CipherMode]::CBC
-				$AESProvider.BlockSize = 128
-				$AESProvider.KeySize = $KeySize
-				$AESProvider.Key = $EncryptionKey
+				if ($PSCmdlet.ParameterSetName -eq 'PlainText')
+				{
+					$Key = $KeyAsPlainText | ConvertTo-SecureString -AsPlainText -Force
+				}
+				
+				#Decrypt AES Key from SecureString
+				$BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($Key)
+				$EncryptionKey = [System.Convert]::FromBase64String([System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR))
+				
+				$AES = [System.Security.Cryptography.Aes]::Create()
+				$AES.Mode = $CipherMode
+				$AES.Padding = $PaddingMode
+				$AES.KeySize = $EncryptionKey.Length * 8
+				$AES.Key = $EncryptionKey
 			}
 			Catch
 			{
@@ -281,20 +341,12 @@ Date: 9/17/2017
 					[Byte[]]$IV = New-Object Byte[] $LIV
 					$FileStreamReader.Seek(4, [System.IO.SeekOrigin]::Begin) | Out-Null
 					$FileStreamReader.Read($IV, 0, $LIV) | Out-Null
-					$AESProvider.IV = $IV
+					$AES.IV = $IV
 					
 					#Peform Decryption
-					$Transform = $AESProvider.CreateDecryptor()
-					[Int]$Count = 0
-					[Int]$BlockSizeBytes = $AESProvider.BlockSize / 8
-					[Byte[]]$Data = New-Object Byte[] $BlockSizeBytes
+					$Transform = $AES.CreateDecryptor()
 					$CryptoStream = New-Object System.Security.Cryptography.CryptoStream($FileStreamWriter, $Transform, [System.Security.Cryptography.CryptoStreamMode]::Write)
-					Do
-					{
-						$Count = $FileStreamReader.Read($Data, 0, $BlockSizeBytes)
-						$CryptoStream.Write($Data, 0, $Count)
-					}
-					While ($Count -gt 0)
+					$FileStreamReader.CopyTo($CryptoStream)
 					
 					#Close open files
 					$CryptoStream.FlushFinalBlock()
@@ -314,6 +366,7 @@ Date: 9/17/2017
 					If ($FileStreamWriter)
 					{
 						#Remove failed file
+						$FileStreamWriter.Close()
 						Remove-Item -LiteralPath $DestinationFile -Force
 					}
 					Continue
@@ -327,6 +380,7 @@ Date: 9/17/2017
 			}
 		}
 	}
+
 	
 	
 	Function New-WPFMessageBox
